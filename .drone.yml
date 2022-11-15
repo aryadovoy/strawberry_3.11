@@ -1,0 +1,385 @@
+kind: pipeline
+name: Boilerplate Back End
+
+definitions:
+  environment: &environment
+    image: yaroappello/mobile-ci:latest
+    environment:
+      AWS_ACCESS_KEY_ID:
+        from_secret: aws_access_key_id
+      AWS_SECRET_ACCESS_KEY:
+        from_secret: aws_secret_access_key
+      CHANNEL_ID: 
+      SLACK_API_TOKEN:
+        from_secret: slack_token
+  slack_commands1: &error_slack_message_commands
+    commands:
+      - /notify_slack.py $SLACK_API_TOKEN $CHANNEL_ID "❌ Back end app build/deployment failed!\n*$DRONE_COMMIT_REF*, ${DRONE_COMMIT_SHA:0:8}\nSee more $DRONE_BUILD_LINK"
+  slack_commands2: &success_slack_message_commands
+    commands:
+      - /notify_slack.py $SLACK_API_TOKEN $CHANNEL_ID "✅ Back end app build/deployment succeeded!\n*$DRONE_COMMIT_REF*, ${DRONE_COMMIT_SHA:0:8}\nSee more $DRONE_BUILD_LINK"
+
+
+steps:
+- name: Tests
+  image: python:3.9-slim-buster
+  username: DOCKER_USER
+  password: DOCKER_PASS
+  commands:
+  - apt-get update && apt-get install -yq --no-install-recommends tini python3-dev awscli gcc g++ gdal-bin libgdal-dev libpq-dev
+  - pip install -r requirements.txt
+  - export $(grep -v '^#' .deploy/dev/.env | xargs)
+  - python -m pytest tests/
+  when:
+    # branch:
+    #   - dev
+    #   - stage
+    #   - prod
+    event:
+    - push
+    - pull_request
+
+
+- name: Build Dev baseimage
+  image: plugins/ecr
+  username: DOCKER_USER
+  password: DOCKER_PASS
+  settings:
+    region: us-east-1
+    repo: 896549618545.dkr.ecr.us-east-1.amazonaws.com/boilerplate-back
+    registry: 896549618545.dkr.ecr.us-east-1.amazonaws.com
+    dockerfile: .deploy/baseimage.Dockerfile
+    access_key:
+      from_secret: aws_access_key_id
+    secret_key:
+      from_secret: aws_secret_access_key
+    tags:
+      - baseimage-dev
+      # - ${DRONE_COMMIT_SHA:0:3}baseimage
+  when:
+    branch: dev
+    event:
+    - push
+    # - pull_request
+
+
+- name: Build Dev FastAPI
+  image: plugins/ecr
+  username: DOCKER_USER
+  password: DOCKER_PASS
+  settings:
+    region: us-east-1
+    repo: 896549618545.dkr.ecr.us-east-1.amazonaws.com/boilerplate-back
+    registry: 896549618545.dkr.ecr.us-east-1.amazonaws.com
+    dockerfile: .deploy/dev/fastapi.Dockerfile
+    access_key:
+      from_secret: aws_access_key_id
+    secret_key:
+      from_secret: aws_secret_access_key
+    tags:
+      - fastapi-dev
+  when:
+    branch: dev
+    event:
+    - push
+    # - pull_request
+
+
+- name: Deploy Dev FastAPI
+  image: kudato/drone-ecs-deploy
+  username: DOCKER_USER
+  password: DOCKER_PASS
+  settings:
+    region: us-east-1
+    access_key:
+      from_secret: aws_access_key_id
+    secret_key:
+      from_secret: aws_secret_access_key
+    cluster: appello-cluster-dev-stage-1
+    service: boilerplate-fastapi-dev
+    compose_file: .deploy/dev/fastapi.docker-compose.yml
+    params_file: .deploy/dev/fastapi.ecs-params.yml
+    target_group_arn: 
+    deploy_tag: fastapi-dev
+    container_name: boilerplate-fastapi-dev
+    container_port: 8000
+  # environment:
+  #   ASM_AWS_ACCESS_KEY_ID:
+  #     from_secret: ASM_AWS_ACCESS_KEY_ID
+  #   ASM_AWS_SECRET_ACCESS_KEY:
+  #     from_secret: ASM_AWS_SECRET_ACCESS_KEY
+  when:
+    branch: dev
+    event:
+    - push
+    # - pull_request
+
+
+
+- name: Update Apollo schema
+  image: alpine
+  commands:
+    - apk update && apk --no-cache add curl
+    - curl -sSL https://rover.apollo.dev/nix/latest | sh
+    - export APOLLO_KEY=user:gh.a7f535c5-1e6a-4c9c-8607-d146dae2c404:J9PVDChemZvFNcwnc8_s_g
+    # TODO: make sure this url is same as in appollo studio
+    - /root/.rover/bin/rover graph introspect https://boilerplate.appelloproject.xyz/graphql | /root/.rover/bin/rover graph publish boilerplate@current --schema -
+  when:
+    branch: dev
+    event:
+    - push
+
+# ------------------------------------------------------------------------------
+# STAGING EVNVIRONMENT
+# ------------------------------------------------------------------------------
+# Base Image
+- name: Build Stage baseimage
+  image: plugins/ecr
+  settings:
+    region: us-east-1
+    access_key:
+      from_secret: aws_access_key_id
+    secret_key:
+      from_secret: aws_secret_access_key
+    repo: 896549618545.dkr.ecr.us-east-1.amazonaws.com/boilerplate-back
+    registry: 896549618545.dkr.ecr.us-east-1.amazonaws.com
+    dockerfile: .deploy/baseimage.Dockerfile
+    tags:
+      - stage_baseimage
+  when:
+    branch: stage
+    event:
+    - push
+    # - pull_request
+
+# FastAPI app
+- name: Build Stage FastAPI
+  image: plugins/ecr
+  settings:
+    region: us-east-1
+    access_key:
+      from_secret: aws_access_key_id
+    secret_key:
+      from_secret: aws_secret_access_key
+    repo: 896549618545.dkr.ecr.us-east-1.amazonaws.com/boilerplate-back
+    registry: 896549618545.dkr.ecr.us-east-1.amazonaws.com
+    dockerfile: .deploy/stage/fastapi.Dockerfile
+    tags:
+      - fastapi-stage
+  when:
+    branch: stage
+    event:
+    - push
+    # - pull_request
+
+- name: Deploy Stage FastAPI
+  image: kudato/drone-ecs-deploy
+  settings:
+    region: us-east-1
+    access_key:
+      from_secret: aws_access_key_id
+    secret_key:
+      from_secret: aws_secret_access_key
+    cluster: appello-cluster-dev-stage-1
+    service: boilerplate-fastapi-stage
+    compose_file: .deploy/stage/fastapi.docker-compose.yml
+    params_file: .deploy/stage/fastapi.ecs-params.yml
+    target_group_arn: 
+    deploy_tag: fastapi-stage
+    container_name: boilerplate-fastapi-stage
+    container_port: 8000
+  environment:
+    ASM_AWS_ACCESS_KEY_ID:
+      from_secret: ASM_AWS_ACCESS_KEY_ID
+    ASM_AWS_SECRET_ACCESS_KEY:
+      from_secret: ASM_AWS_SECRET_ACCESS_KEY
+  when:
+    branch: stage
+    event:
+    - push
+    # - pull_request
+
+# Worker app
+- name: Build Stage Worker
+  image: plugins/ecr
+  settings:
+    region: us-east-1
+    access_key:
+      from_secret: aws_access_key_id
+    secret_key:
+      from_secret: aws_secret_access_key
+    repo: 896549618545.dkr.ecr.us-east-1.amazonaws.com/boilerplate-back
+    registry: 896549618545.dkr.ecr.us-east-1.amazonaws.com
+    dockerfile: .deploy/stage/worker.Dockerfile
+    tags:
+      - stage_worker
+  when:
+    branch: stage
+    event:
+    - push
+    # - pull_request
+
+- name: Deploy Stage Worker
+  image: kudato/drone-ecs-deploy
+  settings:
+    region: us-east-1
+    access_key:
+      from_secret: aws_access_key_id
+    secret_key:
+      from_secret: aws_secret_access_key
+    cluster: appello-cluster-dev-stage-1
+    service: boilerplate-worker-stage
+    compose_file: .deploy/stage/worker.docker-compose.yml
+    params_file: .deploy/stage/worker.ecs-params.yml
+    # target_group_arn:
+    deploy_tag: stage_worker
+    # container_name: boilerplate-worker-stage
+  environment:
+    ASM_AWS_ACCESS_KEY_ID:
+      from_secret: ASM_AWS_ACCESS_KEY_ID
+    ASM_AWS_SECRET_ACCESS_KEY:
+      from_secret: ASM_AWS_SECRET_ACCESS_KEY
+  when:
+    branch: stage
+    event:
+    - push
+    # - pull_request
+
+# ------------------------------------------------------------------------------
+# PRODUCTION EVNVIRONMENT
+# ------------------------------------------------------------------------------
+# Base Image
+- name: Build Prod baseimage
+  image: plugins/ecr
+  settings:
+    region: ap-southeast-2
+    access_key:
+      from_secret: bp_aws_access_key_id
+    secret_key:
+      from_secret: bp_aws_secret_access_key
+    repo: 896549618545.dkr.ecr.ap-southeast-2.amazonaws.com/boilerplate-back
+    registry: 896549618545.dkr.ecr.ap-southeast-2.amazonaws.com
+    dockerfile: .deploy/baseimage.Dockerfile
+    tags:
+      - prod_baseimage
+  when:
+    branch: master
+    event:
+    - push
+    # - pull_request
+
+# FastAPI app
+- name: Build Prod FastAPI
+  image: plugins/ecr
+  settings:
+    region: ap-southeast-2
+    access_key:
+      from_secret: bp_aws_access_key_id
+    secret_key:
+      from_secret: bp_aws_secret_access_key
+    repo: 896549618545.dkr.ecr.ap-southeast-2.amazonaws.com/boilerplate-back
+    registry: 896549618545.dkr.ecr.ap-southeast-2.amazonaws.com
+    dockerfile: .deploy/prod/fastapi.Dockerfile
+    tags:
+      - fastapi-prod
+  when:
+    branch: master
+    event:
+    - push
+    # - pull_request
+
+- name: Deploy Prod FastAPI
+  image: kudato/drone-ecs-deploy
+  settings:
+    region: ap-southeast-2
+    access_key:
+      from_secret: bp_aws_access_key_id
+    secret_key:
+      from_secret: bp_aws_secret_access_key
+    cluster: production
+    service: boilerplate-fastapi-prod
+    compose_file: .deploy/prod/fastapi.docker-compose.yml
+    params_file: .deploy/prod/fastapi.ecs-params.yml
+    target_group_arn: 
+    deploy_tag: fastapi-prod
+    container_name: boilerplate-fastapi-prod
+    container_port: 8000
+  environment:
+    ASM_AWS_ACCESS_KEY_ID:
+      from_secret: ASM_PROD_AWS_ACCESS_KEY_ID
+    ASM_AWS_SECRET_ACCESS_KEY:
+      from_secret: ASM_PROD_AWS_SECRET_ACCESS_KEY
+  when:
+    branch: master
+    event:
+    - push
+    # - pull_request
+
+# Worker app
+- name: Build Prod Worker
+  image: plugins/ecr
+  settings:
+    region: ap-southeast-2
+    access_key:
+      from_secret: bp_aws_access_key_id
+    secret_key:
+      from_secret: bp_aws_secret_access_key
+    repo: 896549618545.dkr.ecr.ap-southeast-2.amazonaws.com/boilerplate-back
+    registry: 896549618545.dkr.ecr.ap-southeast-2.amazonaws.com
+    dockerfile: .deploy/prod/worker.Dockerfile
+    tags:
+      - prod_worker
+  when:
+    branch: master
+    event:
+    - push
+    # - pull_request
+
+- name: Deploy Prod Worker
+  image: kudato/drone-ecs-deploy
+  settings:
+    region: ap-southeast-2
+    access_key:
+      from_secret: bp_aws_access_key_id
+    secret_key:
+      from_secret: bp_aws_secret_access_key
+    cluster: production
+    service: boilerplate-worker-prod
+    compose_file: .deploy/prod/worker.docker-compose.yml
+    params_file: .deploy/prod/worker.ecs-params.yml
+    deploy_tag: prod_worker
+  environment:
+    ASM_AWS_ACCESS_KEY_ID:
+      from_secret: ASM_PROD_AWS_ACCESS_KEY_ID
+    ASM_AWS_SECRET_ACCESS_KEY:
+      from_secret: ASM_PROD_AWS_SECRET_ACCESS_KEY
+  when:
+    branch: master
+    event:
+    - push
+    # - pull_request
+
+# Slack notifications
+- name: Notify Slack about success
+  <<: [*environment, *success_slack_message_commands]
+  when:
+      branch:
+      - dev
+      - stage
+      - master
+      status:
+      - success
+
+- name: Notify Slack about failure
+  <<: [*environment, *error_slack_message_commands]
+  when:
+      branch:
+      - dev
+      - stage
+      - master
+      status:
+      - failure
+
+# Pull Docker secrets
+image_pull_secrets:
+- dockerconfigjson
